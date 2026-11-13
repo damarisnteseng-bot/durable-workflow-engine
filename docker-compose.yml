@@ -7,9 +7,10 @@ services:
       POSTGRES_PASSWORD: workflow_dev_pw
       POSTGRES_DB: workflow
     ports:
-            - "5433:5432"
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
 
 volumes:
   pgdata:

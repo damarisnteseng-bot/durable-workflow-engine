@@ -3,17 +3,15 @@
 var workerName = args.Length > 0 && !args[0].StartsWith("--")
     ? args[0]
     : $"worker-{Environment.ProcessId}";
-bool heartbeatsOn = !args.Contains("--no-heartbeat");
 
 var connectionString =
     "Host=localhost;Port=5433;Username=workflow;Password=workflow_dev_pw;Database=workflow";
 
 await using var dataSource = NpgsqlDataSource.Create(connectionString);
 
-Console.WriteLine($"[{workerName}] started, heartbeats {(heartbeatsOn ? "ON" : "OFF")} (Ctrl+C to stop)");
+Console.WriteLine($"[{workerName}] started (Ctrl+C to stop)");
 
-// Renews the lease every 3 seconds while a job is running.
-// If the update touches 0 rows, we no longer own the job, so we cancel the work.
+// Renews the lease every 3 seconds while a step is running.
 async Task HeartbeatLoop(int jobId, CancellationTokenSource cts)
 {
     try
@@ -36,13 +34,11 @@ async Task HeartbeatLoop(int jobId, CancellationTokenSource cts)
                 cts.Cancel();
                 return;
             }
-
-            Console.WriteLine($"[{workerName}] heartbeat: renewed lease on job {jobId}");
         }
     }
     catch (OperationCanceledException)
     {
-        // Normal: the job finished and we asked the heartbeat to stop
+        // Normal: the step finished and we asked the heartbeat to stop
     }
 }
 
@@ -50,6 +46,33 @@ bool idle = false;
 
 while (true)
 {
+    // Housekeeping 1: a job whose lease expired with no attempts left is DEAD
+    await using var reapCmd = dataSource.CreateCommand(@"
+        UPDATE jobs
+        SET status = 'DEAD', last_error = 'lease expired with no attempts left'
+        WHERE status = 'RUNNING'
+          AND lease_expires_at < now()
+          AND attempts >= max_attempts");
+    int reaped = await reapCmd.ExecuteNonQueryAsync();
+    if (reaped > 0)
+        Console.WriteLine($"[{workerName}] marked {reaped} abandoned job(s) as DEAD");
+
+    // Housekeeping 2: if any parent step is DEAD or CANCELLED, this step can
+    // never run, so cancel it. This cascades one level per loop.
+    await using var cancelCmd = dataSource.CreateCommand(@"
+        UPDATE jobs
+        SET status = 'CANCELLED', last_error = 'a step it depends on failed'
+        WHERE status = 'PENDING'
+          AND EXISTS (
+              SELECT 1 FROM job_dependencies d
+              JOIN jobs p ON p.id = d.depends_on_id
+              WHERE d.job_id = jobs.id AND p.status IN ('DEAD', 'CANCELLED'))");
+    int cancelled = await cancelCmd.ExecuteNonQueryAsync();
+    if (cancelled > 0)
+        Console.WriteLine($"[{workerName}] cancelled {cancelled} step(s) because a dependency failed");
+
+    // Claim a step that is ready: all parents DONE, retry time reached.
+    // Or rescue a step whose lease expired.
     await using var claimCmd = dataSource.CreateCommand(@"
         UPDATE jobs
         SET status = 'RUNNING',
@@ -57,18 +80,24 @@ while (true)
             lease_expires_at = now() + interval '8 seconds',
             attempts = attempts + 1
         WHERE id = (
-            SELECT id FROM jobs
-            WHERE (status = 'PENDING' AND run_after <= now())
-               OR (status = 'RUNNING'
-                   AND (lease_expires_at IS NULL OR lease_expires_at < now()))
-            ORDER BY id
-            FOR UPDATE SKIP LOCKED
+            SELECT j.id FROM jobs j
+            WHERE (j.status = 'PENDING'
+                   AND j.run_after <= now()
+                   AND NOT EXISTS (
+                       SELECT 1 FROM job_dependencies d
+                       JOIN jobs p ON p.id = d.depends_on_id
+                       WHERE d.job_id = j.id AND p.status <> 'DONE'))
+               OR (j.status = 'RUNNING'
+                   AND (j.lease_expires_at IS NULL OR j.lease_expires_at < now()))
+            ORDER BY j.id
+            FOR UPDATE OF j SKIP LOCKED
             LIMIT 1
         )
-        RETURNING id, attempts, max_attempts");
+        RETURNING id, attempts, max_attempts, step_name, workflow_id");
     claimCmd.Parameters.AddWithValue(workerName);
 
-    int jobId = 0, attempt = 0, maxAttempts = 0;
+    int jobId = 0, attempt = 0, maxAttempts = 0, workflowId = 0;
+    string stepName = "?";
     bool found = false;
 
     await using (var reader = await claimCmd.ExecuteReaderAsync())
@@ -79,6 +108,8 @@ while (true)
             jobId = reader.GetInt32(0);
             attempt = reader.GetInt32(1);
             maxAttempts = reader.GetInt32(2);
+            stepName = reader.IsDBNull(3) ? "?" : reader.GetString(3);
+            workflowId = reader.IsDBNull(4) ? 0 : reader.GetInt32(4);
         }
     }
 
@@ -86,7 +117,7 @@ while (true)
     {
         if (!idle)
         {
-            Console.WriteLine($"[{workerName}] nothing to do, waiting...");
+            Console.WriteLine($"[{workerName}] nothing ready, waiting...");
             idle = true;
         }
         await Task.Delay(1000);
@@ -94,25 +125,22 @@ while (true)
     }
 
     idle = false;
-
-    // Job 2 is a deliberately SLOW job (20 seconds), longer than the 8-second lease
-    int workMs = jobId == 2 ? 20000 : 1000;
-    Console.WriteLine($"[{workerName}] claimed job {jobId} (attempt {attempt}/{maxAttempts}), work takes {workMs / 1000}s");
+    Console.WriteLine($"[{workerName}] started wf{workflowId}/{stepName} (job {jobId}, attempt {attempt}/{maxAttempts})");
 
     using var jobCts = new CancellationTokenSource();
-    Task heartbeat = heartbeatsOn ? HeartbeatLoop(jobId, jobCts) : Task.CompletedTask;
+    Task heartbeat = HeartbeatLoop(jobId, jobCts);
 
     bool abandoned = false;
     try
     {
-        await Task.Delay(workMs, jobCts.Token);   // the "work"
+        await Task.Delay(1500, jobCts.Token);   // the "work"
     }
     catch (OperationCanceledException)
     {
         abandoned = true;
     }
 
-    jobCts.Cancel();      // stop the heartbeat
+    jobCts.Cancel();
     await heartbeat;
 
     if (abandoned)
@@ -121,9 +149,11 @@ while (true)
         continue;
     }
 
-    // Simulated failures from Day 6: multiples of 5 always fail,
-    // other multiples of 3 fail on their first attempt only
-    bool shouldFail = jobId % 5 == 0 || (jobId % 3 == 0 && attempt == 1);
+    // Simulated failures, driven by the step's name:
+    //  - names ending in -poison always fail
+    //  - names ending in -flaky fail on the first attempt only
+    bool shouldFail = stepName.EndsWith("-poison")
+                      || (stepName.EndsWith("-flaky") && attempt == 1);
 
     if (!shouldFail)
     {
@@ -134,7 +164,7 @@ while (true)
         int rows = await doneCmd.ExecuteNonQueryAsync();
 
         Console.WriteLine(rows == 1
-            ? $"[{workerName}] finished job {jobId}"
+            ? $"[{workerName}] finished wf{workflowId}/{stepName}"
             : $"[{workerName}] LOST job {jobId}, discarding result");
         continue;
     }
@@ -150,7 +180,7 @@ while (true)
         deadCmd.Parameters.AddWithValue(error);
         await deadCmd.ExecuteNonQueryAsync();
 
-        Console.WriteLine($"[{workerName}] job {jobId} FAILED for good, marked DEAD");
+        Console.WriteLine($"[{workerName}] wf{workflowId}/{stepName} FAILED for good, marked DEAD");
     }
     else
     {
@@ -171,6 +201,6 @@ while (true)
         retryCmd.Parameters.AddWithValue(error);
         await retryCmd.ExecuteNonQueryAsync();
 
-        Console.WriteLine($"[{workerName}] job {jobId} failed, will retry in {seconds:F1}s");
+        Console.WriteLine($"[{workerName}] wf{workflowId}/{stepName} failed, will retry in {seconds:F1}s");
     }
 }

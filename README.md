@@ -1,5 +1,7 @@
 # Durable Workflow Engine
 
+![CI](https://github.com/damarisnteseng-bot/durable-workflow-engine/actions/workflows/ci.yml/badge.svg)
+
 A small workflow engine built on **PostgreSQL** and **.NET 10**. It runs multi-step workflows (DAGs) across several worker processes and keeps going when workers crash, stall or fail.
 
 I built it to understand why tools like Temporal and Airflow exist: what has to be true for background work to survive crashes, retry safely and never silently disappear.
@@ -103,6 +105,32 @@ A failed step is retried with **exponential backoff and jitter**: about 2s, 4s, 
 | A parent step is `DEAD` | Dependency check | All descendants marked `CANCELLED` |
 | Worker clocks disagree | Not applicable | All timing uses the database clock |
 
+## Submitting workflows
+
+Workflows are written in YAML and submitted to the API:
+
+```yaml
+name: ingest-invoice
+steps:
+  - name: download
+  - name: validate
+    depends_on: [download]
+  - name: enrich
+    depends_on: [validate]
+  - name: archive
+    depends_on: [validate]
+  - name: notify
+    depends_on: [enrich, archive]
+```
+
+The API validates a workflow **before storing anything**: required fields, duplicate step names, unknown dependencies and dependency cycles (Kahn's algorithm). A workflow with a cycle is rejected with HTTP 400:
+
+```
+{"errors":["dependency cycle detected; steps involved in or blocked by it: a, b, c"]}
+```
+
+Valid workflows are saved in a single transaction, so workers never see half a workflow. Each step can set its own `max_attempts` (1 to 10, default 3).
+
 ## Run it
 
 Prerequisites: [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) and Docker Desktop.
@@ -111,21 +139,50 @@ Prerequisites: [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) 
 git clone https://github.com/damarisnteseng-bot/durable-workflow-engine.git
 cd durable-workflow-engine
 docker compose up -d
-type db\seed.sql | docker exec -i workflow-postgres psql -U workflow -d workflow
-dotnet build src/Worker
+dotnet build
+```
+
+Wait a few seconds for the database to start, then open three terminals in the project folder.
+
+Terminal 1, the API:
+
+```
+dotnet run --project src/Api
+```
+
+Terminal 2, a worker:
+
+```
 dotnet run --project src/Worker --no-build -- worker-A
 ```
 
-(On macOS/Linux use `cat db/seed.sql | ...` instead of `type`.) Start a second worker in another terminal with `worker-B` to watch the two share the work.
+Terminal 3, submit a workflow and check its status (the first workflow on a fresh database gets id 1000):
 
-To run the chaos test (Windows PowerShell), reseed the database and run:
+```
+curl.exe -X POST http://localhost:5080/workflows --data-binary "@examples\invoice.yml"
+curl.exe http://localhost:5080/workflows/1000
+```
+
+Start a second worker in another terminal with `worker-B` to watch the two share the work.
+
+### Chaos test
+
+The chaos test needs 250 demo steps. This replaces any steps already in the database (Windows PowerShell):
 
 ```
 type db\seed.sql | docker exec -i workflow-postgres psql -U workflow -d workflow
 powershell -ExecutionPolicy Bypass -File .\chaos.ps1
 ```
 
-Postgres is exposed on port 5433. The development password is only for local use.
+On macOS/Linux use `cat db/seed.sql | ...` instead of `type`. Postgres is exposed on port 5433, and the development password is only for local use.
+
+## Tests and CI
+
+```
+dotnet test
+```
+
+15 unit tests cover the workflow validator: cycles (including one hidden inside an otherwise healthy workflow), self-dependencies, unknown and duplicate steps, invalid settings, diamond-shaped fan-out/fan-in, and a 2,000-step chain. GitHub Actions builds the solution and runs the tests on every push.
 
 ## Design decisions
 
@@ -142,10 +199,8 @@ Postgres is exposed on port 5433. The development password is only for local use
 
 Not built yet:
 
-- REST API for submitting workflows, and workflow definitions in YAML with cycle detection (workflows are currently inserted with SQL)
 - Prometheus metrics, tracing and a dashboard
 - Idempotency keys passed to handlers
 - Graceful handling of a database outage (workers currently crash if Postgres is unreachable)
 - `LISTEN/NOTIFY` to replace polling
 - Real step handlers (steps currently simulate work)
-- CI with GitHub Actions

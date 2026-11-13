@@ -126,6 +126,12 @@ while (true)
 
     idle = false;
     Console.WriteLine($"[{workerName}] started wf{workflowId}/{stepName} (job {jobId}, attempt {attempt}/{maxAttempts})");
+    await using var execCmd = dataSource.CreateCommand(
+        "INSERT INTO step_executions (job_id, worker, attempt) VALUES ($1, $2, $3)");
+    execCmd.Parameters.AddWithValue(jobId);
+    execCmd.Parameters.AddWithValue(workerName);
+    execCmd.Parameters.AddWithValue(attempt);
+    await execCmd.ExecuteNonQueryAsync();
 
     using var jobCts = new CancellationTokenSource();
     Task heartbeat = HeartbeatLoop(jobId, jobCts);
@@ -158,7 +164,7 @@ while (true)
     if (!shouldFail)
     {
         await using var doneCmd = dataSource.CreateCommand(
-            "UPDATE jobs SET status = 'DONE' WHERE id = $1 AND claimed_by = $2 AND status = 'RUNNING'");
+                        "UPDATE jobs SET status = 'DONE', finished_at = now() WHERE id = $1 AND claimed_by = $2 AND status = 'RUNNING'");
         doneCmd.Parameters.AddWithValue(jobId);
         doneCmd.Parameters.AddWithValue(workerName);
         int rows = await doneCmd.ExecuteNonQueryAsync();

@@ -1,0 +1,12 @@
+name: ingest-invoice
+steps:
+  - name: download
+  - name: validate
+    depends_on: [download]
+  - name: enrich-flaky
+    depends_on: [validate]
+    max_attempts: 5
+  - name: archive
+    depends_on: [validate]
+  - name: notify
+    depends_on: [enrich-flaky, archive]

@@ -1,0 +1,8 @@
+name: broken-cycle
+steps:
+  - name: a
+    depends_on: [c]
+  - name: b
+    depends_on: [a]
+  - name: c
+    depends_on: [b]

@@ -1,3 +1,5 @@
+CREATE SEQUENCE workflow_id_seq START 1000;
+
 CREATE TABLE jobs (
   id               SERIAL PRIMARY KEY,
   status           TEXT NOT NULL DEFAULT 'PENDING',
@@ -9,6 +11,7 @@ CREATE TABLE jobs (
   run_after        TIMESTAMPTZ NOT NULL DEFAULT now(),
   last_error       TEXT,
   workflow_id      INT,
+  workflow_name    TEXT,
   step_name        TEXT,
   finished_at      TIMESTAMPTZ
 );

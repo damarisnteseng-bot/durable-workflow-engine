@@ -1,0 +1,5 @@
+name: broken-dependency
+steps:
+  - name: a
+    depends_on: [does-not-exist]
+  - name: a

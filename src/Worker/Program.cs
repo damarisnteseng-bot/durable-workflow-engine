@@ -1,20 +1,55 @@
 ﻿using Npgsql;
 
-var workerName = args.Length > 0 ? args[0] : $"worker-{Environment.ProcessId}";
+var workerName = args.Length > 0 && !args[0].StartsWith("--")
+    ? args[0]
+    : $"worker-{Environment.ProcessId}";
+bool heartbeatsOn = !args.Contains("--no-heartbeat");
 
 var connectionString =
     "Host=localhost;Port=5433;Username=workflow;Password=workflow_dev_pw;Database=workflow";
 
 await using var dataSource = NpgsqlDataSource.Create(connectionString);
 
-Console.WriteLine($"[{workerName}] started (press Ctrl+C to stop)");
+Console.WriteLine($"[{workerName}] started, heartbeats {(heartbeatsOn ? "ON" : "OFF")} (Ctrl+C to stop)");
+
+// Renews the lease every 3 seconds while a job is running.
+// If the update touches 0 rows, we no longer own the job, so we cancel the work.
+async Task HeartbeatLoop(int jobId, CancellationTokenSource cts)
+{
+    try
+    {
+        while (!cts.IsCancellationRequested)
+        {
+            await Task.Delay(3000, cts.Token);
+
+            await using var cmd = dataSource.CreateCommand(@"
+                UPDATE jobs
+                SET lease_expires_at = now() + interval '8 seconds'
+                WHERE id = $1 AND claimed_by = $2 AND status = 'RUNNING'");
+            cmd.Parameters.AddWithValue(jobId);
+            cmd.Parameters.AddWithValue(workerName);
+            int rows = await cmd.ExecuteNonQueryAsync();
+
+            if (rows == 0)
+            {
+                Console.WriteLine($"[{workerName}] heartbeat: lost job {jobId}, abandoning it");
+                cts.Cancel();
+                return;
+            }
+
+            Console.WriteLine($"[{workerName}] heartbeat: renewed lease on job {jobId}");
+        }
+    }
+    catch (OperationCanceledException)
+    {
+        // Normal: the job finished and we asked the heartbeat to stop
+    }
+}
 
 bool idle = false;
 
 while (true)
 {
-    // Claim a job that is ready to run (PENDING and its retry time has arrived),
-    // or one whose lease expired (its worker died). Every claim counts as an attempt.
     await using var claimCmd = dataSource.CreateCommand(@"
         UPDATE jobs
         SET status = 'RUNNING',
@@ -59,14 +94,35 @@ while (true)
     }
 
     idle = false;
-    Console.WriteLine($"[{workerName}] claimed job {jobId} (attempt {attempt}/{maxAttempts})");
 
-    // Pretend to do 1 second of work
-    await Task.Delay(1000);
+    // Job 2 is a deliberately SLOW job (20 seconds), longer than the 8-second lease
+    int workMs = jobId == 2 ? 20000 : 1000;
+    Console.WriteLine($"[{workerName}] claimed job {jobId} (attempt {attempt}/{maxAttempts}), work takes {workMs / 1000}s");
 
-    // Simulated failures, so we can watch retries happen:
-    //  - jobs whose id is a multiple of 5 ALWAYS fail (a "poison" job)
-    //  - other multiples of 3 fail on their first attempt only
+    using var jobCts = new CancellationTokenSource();
+    Task heartbeat = heartbeatsOn ? HeartbeatLoop(jobId, jobCts) : Task.CompletedTask;
+
+    bool abandoned = false;
+    try
+    {
+        await Task.Delay(workMs, jobCts.Token);   // the "work"
+    }
+    catch (OperationCanceledException)
+    {
+        abandoned = true;
+    }
+
+    jobCts.Cancel();      // stop the heartbeat
+    await heartbeat;
+
+    if (abandoned)
+    {
+        Console.WriteLine($"[{workerName}] stopped working on job {jobId} (lease lost)");
+        continue;
+    }
+
+    // Simulated failures from Day 6: multiples of 5 always fail,
+    // other multiples of 3 fail on their first attempt only
     bool shouldFail = jobId % 5 == 0 || (jobId % 3 == 0 && attempt == 1);
 
     if (!shouldFail)
@@ -87,7 +143,6 @@ while (true)
 
     if (attempt >= maxAttempts)
     {
-        // Out of attempts: park it as DEAD
         await using var deadCmd = dataSource.CreateCommand(
             "UPDATE jobs SET status = 'DEAD', last_error = $3 WHERE id = $1 AND claimed_by = $2 AND status = 'RUNNING'");
         deadCmd.Parameters.AddWithValue(jobId);
@@ -99,8 +154,6 @@ while (true)
     }
     else
     {
-        // Exponential backoff with jitter: about 2s, 4s, 8s... capped at 30s,
-        // multiplied by a random factor between 0.5 and 1.5
         double seconds = Math.Min(30, 2 * Math.Pow(2, attempt - 1))
                          * (0.5 + Random.Shared.NextDouble());
 

@@ -140,7 +140,28 @@ while (true)
     bool abandoned = false;
     try
     {
-        await Task.Delay(1500, jobCts.Token);   // the "work"
+              await Task.Delay(750, jobCts.Token);   // first half of the work
+
+        // The step's side effect (think "send the email"), made idempotent with a
+        // stable key. If this step runs twice, the second request is recognised
+        // and the side effect is NOT repeated.
+        string idempotencyKey = $"wf{workflowId}:{stepName}";
+        await using var effectCmd = dataSource.CreateCommand(@"
+            INSERT INTO effects (idempotency_key, job_id, step_name, worker)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (idempotency_key)
+            DO UPDATE SET times_requested = effects.times_requested + 1
+            RETURNING times_requested");
+        effectCmd.Parameters.AddWithValue(idempotencyKey);
+        effectCmd.Parameters.AddWithValue(jobId);
+        effectCmd.Parameters.AddWithValue(stepName);
+        effectCmd.Parameters.AddWithValue(workerName);
+        int timesRequested = (int)(await effectCmd.ExecuteScalarAsync())!;
+
+        if (timesRequested > 1)
+            Console.WriteLine($"[{workerName}] {idempotencyKey} already applied (request #{timesRequested}), skipping side effect");
+
+        await Task.Delay(750, jobCts.Token);   // second half of the work // the "work"
     }
     catch (OperationCanceledException)
     {

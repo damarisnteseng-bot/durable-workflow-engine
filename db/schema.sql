@@ -29,3 +29,12 @@ CREATE TABLE step_executions (
   attempt    INT,
   started_at TIMESTAMPTZ DEFAULT now()
 );
+
+CREATE TABLE effects (
+  idempotency_key TEXT PRIMARY KEY,
+  job_id          INT NOT NULL,
+  step_name       TEXT,
+  worker          TEXT,
+  times_requested INT NOT NULL DEFAULT 1,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);

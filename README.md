@@ -12,14 +12,15 @@ I built it to understand why tools like Temporal and Airflow exist: what has to 
 
 | Check | Result |
 |---|---|
-| Worker kills during the run | 21 |
-| Total run time | 117 seconds |
+| | Worker kills during the run | **20** |
+| Total run time | 109 seconds |
 | Steps finished | **250 of 250** (none lost) |
 | Steps that finished before a step they depend on | **0** |
-| Steps executed more than once (rescued after a kill) | 18 (no step ran more than twice) |
-| Total step executions | 268 |
+| Steps re-executed after a worker died | 18 (268 executions in total) |
+| Side effects applied | **250, each exactly once** |
+| Duplicate side-effect requests caught and skipped | 8 |
 
-The 18 repeats are expected: execution is **at-least-once**. When a worker dies mid-step, another worker re-runs that step. Real step handlers must therefore be idempotent (safe to run twice).
+Execution is **at-least-once**: when a worker dies mid-step, another worker re-runs that step, which is why there were 268 executions for 250 steps. Results are **effectively-once**: each step's side effect is protected by an idempotency key, so the repeats did no harm. See [Idempotent side effects](#idempotent-side-effects).
 
 Each step simulates 1.5 seconds of work, so these numbers show correctness under failure, not raw throughput.
 
@@ -85,18 +86,34 @@ stateDiagram-v2
 
 A failed step is retried with **exponential backoff and jitter**: about 2s, 4s, 8s... capped at 30s, multiplied by a random factor between 0.5 and 1.5 so failing steps don't all retry at the same moment. After 3 attempts the step becomes `DEAD`. Steps that depend on it are marked `CANCELLED` without ever running.
 
+### Idempotent side effects
+
+Because a step can run more than once, anything with a real-world effect (sending an email, charging a card) must be safe to repeat. Each step gets a stable idempotency key, `wf<workflow id>:<step name>`, which is the same on every retry. The demo handler records its effect like this:
+
+```sql
+INSERT INTO effects (idempotency_key, job_id, step_name, worker)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (idempotency_key)
+DO UPDATE SET times_requested = effects.times_requested + 1
+RETURNING times_requested;
+```
+
+The key is the primary key of the `effects` table, so it can exist only once. If `times_requested` comes back greater than 1, the handler knows the effect was already applied and skips it. In the chaos test, 258 requests reached this table: 250 were applied and 8 were recognised as repeats. A plain `INSERT` would have produced 258 rows.
+
 ## Guarantees
 
 - **At-least-once execution.** A step may run more than once, never zero times (unless it is `DEAD` or `CANCELLED`).
+- **Effectively-once side effects**, for handlers that use the idempotency key.
 - **Dependency order.** A step never starts before all its parents are `DONE`.
 - **No double claiming.** Two workers cannot claim the same step at the same moment. If a lease expires, the step is reassigned and the old worker's result is rejected.
-- **Not exactly-once.** Exactly-once is not achievable across a network boundary. Step handlers should be idempotent.
+- **Not exactly-once execution.** That is not achievable across a network boundary, which is why handlers must be idempotent.
 
 ## Failure modes and how they are handled
 
 | Failure | How it is detected | What happens |
 |---|---|---|
 | Worker crashes mid-step | Lease expires (8s) | Another worker reclaims the step, attempt count increases |
+| Worker crashes after applying a side effect | Lease expires, step re-runs | Idempotency key recognises the repeat, effect is not applied twice |
 | Worker is slow, not dead | Heartbeat keeps arriving | Lease is renewed, step is left alone |
 | "Zombie" worker finishes after losing its lease | Fencing check updates 0 rows | Its result is discarded, it stops working |
 | Step fails | Handler reports failure | Retry with exponential backoff and jitter |
@@ -165,16 +182,21 @@ curl.exe http://localhost:5080/workflows/1000
 
 Start a second worker in another terminal with `worker-B` to watch the two share the work.
 
+### Configuration
+
+Both programs read the database connection from the `DB_CONNECTION` environment variable and fall back to the local Docker database if it is not set. Postgres is exposed on port 5433, and the development password is only for local use.
+
 ### Chaos test
 
 The chaos test needs 250 demo steps. This replaces any steps already in the database (Windows PowerShell):
 
 ```
+del logs\*.log
 type db\seed.sql | docker exec -i workflow-postgres psql -U workflow -d workflow
 powershell -ExecutionPolicy Bypass -File .\chaos.ps1
 ```
 
-On macOS/Linux use `cat db/seed.sql | ...` instead of `type`. Postgres is exposed on port 5433, and the development password is only for local use.
+On macOS/Linux use `cat db/seed.sql | ...` instead of `type`.
 
 ## Tests and CI
 
@@ -189,6 +211,7 @@ dotnet test
 - **Postgres instead of Kafka or Redis.** Job state, dependencies and the queue live in one transactional store, so a claim and a state change can never disagree. The trade-offs are polling (workers check every second) and a single database as the throughput ceiling. I would move to a dedicated broker for very high throughput or multi-region workloads.
 - **Leases instead of locks.** A lock held by a dead worker blocks forever. A lease expires on its own.
 - **Lease longer than heartbeat interval.** An 8-second lease with a 3-second heartbeat tolerates one missed heartbeat without a false takeover.
+- **Idempotency in the database, not in the engine.** The engine promises at-least-once execution and hands every step a stable key. The handler uses that key with a unique constraint to make its side effect safe to repeat.
 
 ## Bugs the tests caught
 
@@ -200,7 +223,6 @@ dotnet test
 Not built yet:
 
 - Prometheus metrics, tracing and a dashboard
-- Idempotency keys passed to handlers
 - Graceful handling of a database outage (workers currently crash if Postgres is unreachable)
 - `LISTEN/NOTIFY` to replace polling
-- Real step handlers (steps currently simulate work)
+- Real step handlers (steps currently simulate work, and the idempotent effect is a demo)

@@ -1,6 +1,6 @@
 -- Creates 50 workflows of 5 steps each:
 -- download -> validate -> (enrich, archive) -> notify
-TRUNCATE jobs, job_dependencies, step_executions RESTART IDENTITY;
+TRUNCATE jobs, job_dependencies, step_executions, effects RESTART IDENTITY;
 
 DO $$
 DECLARE wf INT; a INT; b INT; c INT; d INT; e INT;

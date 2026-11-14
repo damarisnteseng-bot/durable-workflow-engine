@@ -6,7 +6,8 @@ using YamlDotNet.Serialization.NamingConventions;
 var builder = WebApplication.CreateBuilder(args);
 
 var connectionString =
-    "Host=localhost;Port=5433;Username=workflow;Password=workflow_dev_pw;Database=workflow";
+    Environment.GetEnvironmentVariable("DB_CONNECTION")
+    ?? "Host=localhost;Port=5433;Username=workflow;Password=workflow_dev_pw;Database=workflow";
 builder.Services.AddSingleton(NpgsqlDataSource.Create(connectionString));
 
 var app = builder.Build();

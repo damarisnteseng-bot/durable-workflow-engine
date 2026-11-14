@@ -5,7 +5,8 @@ var workerName = args.Length > 0 && !args[0].StartsWith("--")
     : $"worker-{Environment.ProcessId}";
 
 var connectionString =
-    "Host=localhost;Port=5433;Username=workflow;Password=workflow_dev_pw;Database=workflow";
+    Environment.GetEnvironmentVariable("DB_CONNECTION")
+    ?? "Host=localhost;Port=5433;Username=workflow;Password=workflow_dev_pw;Database=workflow";
 
 await using var dataSource = NpgsqlDataSource.Create(connectionString);
 

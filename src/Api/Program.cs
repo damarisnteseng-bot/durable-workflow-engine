@@ -125,4 +125,4 @@ app.MapGet("/workflows/{id:int}", async (int id, NpgsqlDataSource db) =>
     return Results.Ok(new { workflowId = id, name, status, steps });
 });
 
-app.Run("http://localhost:5080");
+app.Run(Environment.GetEnvironmentVariable("API_URL") ?? "http://localhost:5080");

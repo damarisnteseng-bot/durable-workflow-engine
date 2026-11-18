@@ -2,7 +2,7 @@
 
 var workerName = args.Length > 0 && !args[0].StartsWith("--")
     ? args[0]
-    : $"worker-{Environment.ProcessId}";
+    : $"{Environment.MachineName}-{Environment.ProcessId}";
 
 var connectionString =
     Environment.GetEnvironmentVariable("DB_CONNECTION")

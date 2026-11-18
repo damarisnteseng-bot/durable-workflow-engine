@@ -11,6 +11,36 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U workflow -d workflow"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: src/Api/Dockerfile
+    environment:
+      DB_CONNECTION: "Host=postgres;Port=5432;Username=workflow;Password=workflow_dev_pw;Database=workflow"
+      API_URL: "http://0.0.0.0:8080"
+    ports:
+      - "5080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: src/Worker/Dockerfile
+    environment:
+      DB_CONNECTION: "Host=postgres;Port=5432;Username=workflow;Password=workflow_dev_pw;Database=workflow"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      replicas: 2
 
 volumes:
   pgdata:

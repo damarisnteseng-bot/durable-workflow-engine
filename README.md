@@ -12,7 +12,7 @@ I built it to understand why tools like Temporal and Airflow exist: what has to 
 
 | Check | Result |
 |---|---|
-| | Worker kills during the run | **20** |
+| Worker kills during the run | **20** |
 | Total run time | 109 seconds |
 | Steps finished | **250 of 250** (none lost) |
 | Steps that finished before a step they depend on | **0** |
@@ -150,53 +150,79 @@ Valid workflows are saved in a single transaction, so workers never see half a w
 
 ## Run it
 
-Prerequisites: [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) and Docker Desktop.
+Prerequisite: Docker Desktop.
 
 ```
 git clone https://github.com/damarisnteseng-bot/durable-workflow-engine.git
 cd durable-workflow-engine
-docker compose up -d
-dotnet build
+docker compose up -d --build
 ```
 
-Wait a few seconds for the database to start, then open three terminals in the project folder.
-
-Terminal 1, the API:
-
-```
-dotnet run --project src/Api
-```
-
-Terminal 2, a worker:
-
-```
-dotnet run --project src/Worker --no-build -- worker-A
-```
-
-Terminal 3, submit a workflow and check its status (the first workflow on a fresh database gets id 1000):
+This starts Postgres, the API (http://localhost:5080) and 2 workers. Submit a workflow and check its status (the first workflow on a fresh database gets id 1000):
 
 ```
 curl.exe -X POST http://localhost:5080/workflows --data-binary "@examples\invoice.yml"
 curl.exe http://localhost:5080/workflows/1000
 ```
 
-Start a second worker in another terminal with `worker-B` to watch the two share the work.
+Watch the workers, scale them, or stop everything:
+
+```
+docker compose logs -f worker
+docker compose up -d --scale worker=4
+docker compose down
+```
+
+### Running the apps without Docker
+
+Keep Postgres in Docker and run the API and workers with the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0). Stop the containerised API and workers first, because they use the same port and database:
+
+```
+docker compose stop api worker
+dotnet build
+dotnet run --project src/Api
+dotnet run --project src/Worker --no-build -- worker-A
+```
 
 ### Configuration
 
-Both programs read the database connection from the `DB_CONNECTION` environment variable and fall back to the local Docker database if it is not set. Postgres is exposed on port 5433, and the development password is only for local use.
+Both programs read the database connection from the `DB_CONNECTION` environment variable and fall back to the local Docker database if it is not set. The API listens on the address in `API_URL` (default `http://localhost:5080`). Postgres is exposed on port 5433, and the development password is only for local use.
 
 ### Chaos test
 
-The chaos test needs 250 demo steps. This replaces any steps already in the database (Windows PowerShell):
+The chaos test needs the .NET SDK and 250 demo steps. It starts its own workers, so stop the containerised ones first. This replaces any steps already in the database (Windows PowerShell):
 
 ```
-del logs\*.log
+docker compose stop api worker
+dotnet build
 type db\seed.sql | docker exec -i workflow-postgres psql -U workflow -d workflow
 powershell -ExecutionPolicy Bypass -File .\chaos.ps1
 ```
 
-On macOS/Linux use `cat db/seed.sql | ...` instead of `type`.
+On macOS/Linux use `cat db/seed.sql | ...` instead of `type`. The script refuses to start if there is nothing to process, and stops with an error if it cannot reach the database.
+
+## Try it: crash a worker
+
+With the stack running, watch the workers in one terminal:
+
+```
+docker compose logs -f --tail 0 worker
+```
+
+In a second terminal, queue 10 workflows and then hard-kill one worker container (Windows Command Prompt):
+
+```
+for /L %i in (1,1,10) do @curl.exe -s -X POST http://localhost:5080/workflows --data-binary "@examples\invoice.yml" -o nul
+docker kill durable-workflow-engine-worker-1
+```
+
+The killed worker's in-flight step stops reporting. About 8 seconds later its lease expires and another worker picks the step up again (look for a line ending `attempt 2/3`; the `enrich-flaky` step is designed to fail once and shows `/5`). When the queue drains, every step is `DONE`:
+
+```
+docker exec -it workflow-postgres psql -U workflow -d workflow -c "SELECT status, count(*) FROM jobs GROUP BY status;"
+```
+
+Bring the killed worker back with `docker compose up -d`.
 
 ## Tests and CI
 
@@ -217,6 +243,7 @@ dotnet test
 
 - **Livelock without heartbeats.** A 20-second step with an 8-second lease was stolen repeatedly by two workers, and neither could finish it. Heartbeats fixed this.
 - **Attempts exceeding the maximum.** A step whose lease kept expiring never reported a failure, so it skipped the "give up after 3 attempts" rule (attempt counts reached 12). It is now marked `DEAD` once its lease expires with no attempts left.
+- **A test script that reported success when it couldn't read the database.** The chaos script now stops with an error instead.
 
 ## Limitations and roadmap
 

@@ -12,15 +12,15 @@ I built it to understand why tools like Temporal and Airflow exist: what has to 
 
 | Check | Result |
 |---|---|
-| Worker kills during the run | **20** |
-| Total run time | 109 seconds |
+| Worker kills during the run | **21** |
+| Total run time | 121 seconds |
 | Steps finished | **250 of 250** (none lost) |
 | Steps that finished before a step they depend on | **0** |
-| Steps re-executed after a worker died | 18 (268 executions in total) |
+| Steps re-executed after a worker died | 19 (269 executions in total) |
 | Side effects applied | **250, each exactly once** |
-| Duplicate side-effect requests caught and skipped | 8 |
+| Duplicate side-effect requests caught and skipped | 10 |
 
-Execution is **at-least-once**: when a worker dies mid-step, another worker re-runs that step, which is why there were 268 executions for 250 steps. Results are **effectively-once**: each step's side effect is protected by an idempotency key, so the repeats did no harm. See [Idempotent side effects](#idempotent-side-effects).
+Execution is **at-least-once**: when a worker dies mid-step, another worker re-runs that step, which is why there were 269 executions for 250 steps. Results are **effectively-once**: each step's side effect is protected by an idempotency key, so the repeats did no harm. See [Idempotent side effects](#idempotent-side-effects).
 
 Each step simulates 1.5 seconds of work, so these numbers show correctness under failure, not raw throughput.
 
@@ -98,7 +98,7 @@ DO UPDATE SET times_requested = effects.times_requested + 1
 RETURNING times_requested;
 ```
 
-The key is the primary key of the `effects` table, so it can exist only once. If `times_requested` comes back greater than 1, the handler knows the effect was already applied and skips it. In the chaos test, 258 requests reached this table: 250 were applied and 8 were recognised as repeats. A plain `INSERT` would have produced 258 rows.
+The key is the primary key of the `effects` table, so it can exist only once. If `times_requested` comes back greater than 1, the handler knows the effect was already applied and skips it. In the chaos test, 260 requests reached this table: 250 were applied and 10 were recognised as repeats. A plain `INSERT` would have produced 260 rows.
 
 ## Guarantees
 
